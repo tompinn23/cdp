@@ -1,19 +1,22 @@
+#include "parser.h"
+#include "context.h"
 
 #include <string.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 
 typedef enum tok_type {
   TOK_IDENT,
   TOK_COLON,
   TOK_ASSIGN,
+  TOK_EQUALS,
   TOK_COMMAND,
   TOK_DOLLAR,
   TOK_LEFT_PAREN, TOK_RIGHT_PAREN,
   TOK_ERROR,
-  TOK_SPACES,
-  TOK_TABS,
+  TOK_WS,
   TOK_STRING,
   TOK_NEWLINE,
   TOK_EOF,
@@ -23,12 +26,12 @@ static char *tok_name[] ={
   "IDENT",
   "COLON",
   "ASSIGN",
+  "EQUALS",
   "COMMAND",
   "DOLLAR",
   "LEFT_PAREN", "RIGHT_PAREN",
   "ERROR",
-  "SPACES",
-  "TABS",
+  "WS",
   "STRING",
   "NEWLINE",
   "EOF",
@@ -94,16 +97,14 @@ static tok_t make_ws(lex_t *l) {
     char c = peek(l);
     switch(c) {
       case ' ':
-        while(peek(l) == ' ' && !at_eof(l)) advance(l);
-        return make_token(l, TOK_SPACES);
       case '\t':
-        while(peek(l) == '\t' && !at_eof(l)) advance(l);
-        return make_token(l, TOK_TABS);
+        while((peek(l) == ' ' || peek(l) == '\t') && !at_eof(l)) advance(l);
+        return make_token(l, TOK_WS);
       case '\r':
         advance(l);
         break;
       default:
-        return (tok_t){ .type = TOK_SPACES, .length = 0, .line = l->line, .start = ""};
+        return (tok_t){ .type = TOK_WS, .length = 0, .line = l->line, .start = ""};
     }
   }
 }
@@ -124,7 +125,7 @@ static bool is_alpha(char c) {
     c == '_';
 }
 
-static char* reserved = "<>:\"|?*";
+static char* reserved = "<>:\"|?*()";
 
 static bool is_reserved(char c) {
   if(c < 31 && c >= 0) {
@@ -167,6 +168,8 @@ static tok_t scan_token(lex_t *l) {
         return make_token(l, TOK_ASSIGN);
       }
       return make_token(l, TOK_COLON);
+    case '=':
+      return make_token(l, TOK_EQUALS);
     case '$':
       return make_token(l, TOK_DOLLAR);
     case '(':
@@ -181,6 +184,138 @@ static tok_t scan_token(lex_t *l) {
   }
  	return error_token(l, "unexpected character");
 }
+
+typedef struct parser {
+  tok_t current, previous;
+  lex_t *lex;
+  bool had_error, panic_mode;
+  ctx_t *context;
+} parser_t;
+
+static int init_parser(parser_t *p, lex_t *l, ctx_t *c) {
+  memset(p, 0, sizeof *p);
+  p->lex = l;
+  p->context = c;
+  p->had_error = p->panic_mode = false;
+}
+
+static void err_at(parser_t* p, tok_t* t, const char* message) {
+	if(p->panic_mode) return;
+	p->panic_mode = true;
+	fprintf(stderr, "[line %d] err ", t->line);
+	if(t->type == TOK_EOF) {
+		fprintf(stderr, "at end");
+	} else if(t->type == TOK_ERROR) {}
+	else {
+		fprintf(stderr, "at '%.*s'", t->length, t->start);
+	}
+	fprintf(stderr, ": %s\n", message);
+	p->had_error = true;
+}
+
+static void err_at_current(parser_t* p, const char* message) {
+	err_at(p, &p->current, message);
+}
+
+static void err(parser_t* p, const char* message) {
+	err_at(p, &p->previous, message);
+}
+
+static void parse_advance(parser_t* p) {
+	p->previous = p->current;
+	for(;;) {
+		p->current = scan_token(p->lex);
+    printf("tok: [%s] - %.*s\n", tok_name[p->current.type], p->current.length, p->current.start);
+		if(p->current.type != TOK_ERROR) break;
+		err_at_current(p, p->current.start);
+	}
+}
+
+static void expect(parser_t *p, tok_type type, const char* message) {
+	if(p->current.type == type) {
+		parse_advance(p);
+		return;
+	}
+
+	err_at_current(p, message);
+}
+
+static void expectws(parser_t *p, tok_type type, const char *message) {
+  while(p->current.type == TOK_WS) {
+    parse_advance(p);
+  }
+  expect(p, type, message);
+}
+
+static bool current(parser_t* p, tok_type type) {
+	return p->current.type == type;
+}
+
+static bool match(parser_t* p, tok_type type) {
+	if(p->current.type != type) {
+		return false;
+	}
+	return true;
+}
+
+static bool consume(parser_t *p, tok_type type) {
+  if(p->current.type == type) {
+    parse_advance(p);
+    return true;
+  }
+  return false;
+}
+static bool consume_skipws(parser_t *p, tok_type type) {
+  while(p->current.type == TOK_WS) { parse_advance(p); }
+  return consume(p, type);
+}
+
+static void synchronize(parser_t *p) {
+  p->panic_mode = false;
+  while(p->current.type != TOK_EOF) {
+    if(p->previous.type == TOK_NEWLINE) return;
+    parse_advance(p);
+  }
+}
+
+static void var_declaration(parser_t *p) {
+  const char *name = strndup(p->previous.start, p->previous.length);
+  if(consume(p, TOK_ASSIGN) && consume_skipws(p, TOK_STRING)) {
+    printf("immediate assign\n");
+    char *string = strndup(p->current.start, p->current.length);
+    char* resolved = ctx_resolve_value(p->context, string);
+    free(string);
+    ctx_add_variable(p->context, name, resolved);
+  } else if(consume(p, TOK_EQUALS) && consume_skipws(p, TOK_STRING)) {
+    printf("lazy assign\n");
+    char *string = strndup(p->current.start, p->current.length);
+    ctx_add_variable(p->context, name, string);
+  }
+  expectws(p, TOK_NEWLINE, "expected newline");
+}
+
+static void rule(parser_t *p) {
+  char *name = strndup(p->previous.start, p->previous.length);
+  parse_advance(p); // advance past the colon once we've stored the rule name
+  while(!match(p, TOK_NEWLINE)) {
+    if(consume_skipws(p, TOK_DOLLAR) && consume(p, TOK_LEFT_PAREN) && consume(p, TOK_IDENT)) {
+      printf("%.*s\n", p->previous.length, p->previous.start);
+    }
+  }
+}
+
+static void declaration(parser_t *p) {
+  while(consume(p, TOK_NEWLINE)) {}
+  if(consume(p, TOK_IDENT) && (current(p, TOK_EQUALS) || current(p, TOK_ASSIGN))) {
+    var_declaration(p);
+  }
+  /* if consume an identifier and now we have colon */
+  if(consume(p, TOK_IDENT) && current(p, TOK_COLON)) {
+    rule(p);
+  }
+  if(p->panic_mode) synchronize(p);
+}
+
 
 static char* slurp(const char* path) {
   FILE* file = fopen(path, "rb");
@@ -201,6 +336,35 @@ static char* slurp(const char* path) {
 }
 
 
+int parse_file(const char *path) {
+  char *source = slurp(path);
+  if(!source) {
+    return -1;
+  }
+  lex_t l;
+  parser_t p;
+  ctx_t context;
+  ctx_init(&context);
+  init_lexer(&l, source);
+  init_parser(&p, &l, &context);
+
+  parse_advance(&p);
+  while(!match(&p, TOK_EOF) && !p.had_error) {
+    printf("decl\n");
+    declaration(&p);
+    gets();
+  }
+  expect(&p, TOK_EOF, "expected end of file");
+  if(p.had_error) {
+    fprintf(stderr, "ERROR parsing\n");
+  }
+}
+
+
+
+
+
+
 #ifdef PS_MAIN
 int main(int argc, char **argv) {
   char *buf = slurp("test.mk");
@@ -216,3 +380,4 @@ int main(int argc, char **argv) {
   return 0;
 }
 #endif
+

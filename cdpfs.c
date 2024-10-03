@@ -1,7 +1,6 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #include "fuse_log.h"
-#include <cerrno>
 #include <fcntl.h>
 #include <linux/limits.h>
 #include <stdint.h>
